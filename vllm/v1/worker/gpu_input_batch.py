@@ -25,6 +25,8 @@ from vllm.v1.spec_decode.utils import is_spec_decode_unsupported
 from vllm.v1.utils import copy_slice
 from vllm.v1.worker.block_table import MultiGroupBlockTable
 
+from vllm.logger import init_logger
+logger = init_logger(__name__)
 
 @dataclass
 class CachedRequestState:
@@ -107,6 +109,23 @@ class InputBatch:
             pin_memory=False,
         )
         self.token_ids_cpu = self.token_ids_cpu_tensor.numpy()
+        logger.info(f'Initializing logprob cpu ten, shape={(max_num_reqs, max_model_len, self.vocab_size)}')
+        self.logprobs_cpu_tensor = torch.zeros(
+            (max_num_reqs, max_model_len, 21),
+            device="cpu",
+            dtype=torch.float32,
+            pin_memory=False,
+        )
+
+        self.logprob_ids_cpu_tensor = torch.zeros(
+            (max_num_reqs, max_model_len, 21),
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=False,
+        )
+
+        self.logprobs_cpu = self.logprobs_cpu_tensor.numpy()
+        self.logprob_ids_cpu = self.logprob_ids_cpu_tensor.numpy()
         self.num_tokens = np.zeros(max_num_reqs, dtype=np.int32)
         self.num_tokens_no_spec = np.zeros(max_num_reqs, dtype=np.int32)
         self.num_prompt_tokens = np.zeros(max_num_reqs, dtype=np.int32)
@@ -305,6 +324,9 @@ class InputBatch:
         end_idx = start_idx + len(request.output_token_ids)
         self.token_ids_cpu[req_index,
                            start_idx:end_idx] = request.output_token_ids
+        #logger.info(f'Adding Request, req id={req_index} {start_idx}<->{end_idx}')
+        self.logprobs_cpu[req_index, start_idx:end_idx] =  0
+        self.logprob_ids_cpu[req_index, start_idx:end_idx] = 0
         # Number of token ids in token_ids_cpu.
         # NOTE(woosuk): This may include spec decode tokens.
         self.num_tokens[req_index] = request.num_tokens

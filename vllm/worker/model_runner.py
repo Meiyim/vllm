@@ -1625,6 +1625,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         num_steps: int = 1,
         **kwargs,
     ) -> Optional[Union[List[SamplerOutput], IntermediateTensors]]:
+        logger.info(f'DEBUG:{__file__} executing model')
         if num_steps > 1:
             raise ValueError("num_steps > 1 is not supported in ModelRunner")
 
@@ -1792,8 +1793,10 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                     valid_outputs.append(sequence_group_output)
                     sampled_token_ids.append(
                         sequence_group_output.samples[0].output_token)
-                sampled_token_ids = torch.tensor(sampled_token_ids).to(
-                    self.device)
+
+                #sampled_logprobs = [output.samples[0].logprobs for output in valid_outputs]
+                sampled_token_ids = torch.tensor(sampled_token_ids).to(self.device)
+                #print(f'DEBUG:{__file__}, sampled_token_ids:{sampled_token_ids}, lp:{sequence_group_output.samples[0].logprobs}')
                 sampled_token_ids = broadcast_tensor_dict(
                     {"sampled_token_ids":
                      sampled_token_ids})["sampled_token_ids"]
