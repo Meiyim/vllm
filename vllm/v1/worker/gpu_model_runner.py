@@ -244,6 +244,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.input_ids = torch.zeros(self.max_num_tokens,
                                      dtype=torch.int32,
                                      device=self.device)
+
+        self.input_logprobs = torch.zeros(self.max_num_tokens,21,
+                                          dtype=torch.float32,
+                                          device=self.device)
+
+        self.input_logprob_ids = torch.zeros(self.max_num_tokens,21,
+                                          dtype=torch.int32,
+                                          device=self.device)
+
         self.positions = torch.zeros(self.max_num_tokens,
                                      dtype=torch.int64,
                                      device=self.device)
@@ -303,6 +312,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                          dtype=torch.int32,
                                          device="cpu",
                                          pin_memory=self.pin_memory)
+        self.input_logprobs_cpu = torch.zeros(self.max_num_tokens,21,
+                                          dtype=torch.float32,
+                                          device='cpu')
+
+        self.input_logprob_ids_cpu = torch.zeros(self.max_num_tokens,21,
+                                          dtype=torch.int32,
+                                          device='cpu')
+
+
         self.positions_cpu = torch.zeros(self.max_num_tokens,
                                          dtype=torch.int64,
                                          device="cpu",
@@ -752,6 +770,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                            0,
                            torch.from_numpy(token_indices),
                            out=self.input_ids_cpu[:total_num_scheduled_tokens])
+        
+        torch.index_select(self.input_batch.logprobs_cpu_tensor.view(-1, 21),
+                            0,
+                           torch.from_numpy(token_indices),
+                           out=self.input_logprobs_cpu[:total_num_scheduled_tokens])
+
+        torch.index_select(self.input_batch.logprob_ids_cpu_tensor.view(-1,21),
+                            0,
+                           torch.from_numpy(token_indices),
+                           out=self.input_logprob_ids_cpu[:total_num_scheduled_tokens])
+
 
         self.input_batch.block_table.compute_slot_mapping(
             req_indices, positions_np)
@@ -778,6 +807,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Copy the tensors to the GPU.
         self.input_ids[:total_num_scheduled_tokens].copy_(
             self.input_ids_cpu[:total_num_scheduled_tokens], non_blocking=True)
+
+        self.input_logprobs[:total_num_scheduled_tokens].copy_(
+            self.input_logprobs_cpu[:total_num_scheduled_tokens], non_blocking=True)
+
+        self.input_logprob_ids[:total_num_scheduled_tokens].copy_(
+            self.input_logprob_ids_cpu[:total_num_scheduled_tokens], non_blocking=True)
+
         if self.uses_mrope:
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
             self.mrope_positions[:, :total_num_scheduled_tokens].copy_(
@@ -1580,6 +1616,21 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # then the embedding layer is not included in the CUDA graph.
             input_ids = self.input_ids[:num_input_tokens]
             inputs_embeds = None
+
+            emb = self.model.model.embed_tokens
+            topk_ids = self.input_logprob_ids[:num_input_tokens] # [B,20]
+            orig_shape = topk_ids.shape
+            embbed = emb(topk_ids.view(-1))
+            embbed = embbed.view(orig_shape+(embbed.shape[-1],)) #[B,20,h]
+            logprob = self.input_logprobs[:num_input_tokens] #[B,20]
+            logger.info(f'logprob:{logprob.shape}, embbed:{embbed.shape}')
+            total_prob_sum = logprob.exp().sum(-1,keepdim=True)
+            prob = logprob.exp()/total_prob_sum #[B,20]
+            #inputs_embeds = (prob.unsqueeze(-1) * embbed).sum(1).to(embbed)
+            inputs_embeds = embbed[:,:1,:].mean(1).to(embbed)
+            #inputs_embeds = embbed[:,0,:].contiguous()
+            logger.info(f'mix prob:{total_prob_sum}, input_embeds:{inputs_embeds.dtype} {inputs_embeds}')
+
             model_kwargs = self._init_model_kwargs(num_input_tokens)
         if self.uses_mrope:
             positions = self.mrope_positions[:, :num_input_tokens]
@@ -1729,6 +1780,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Get the valid generated tokens.
         sampled_token_ids = sampler_output.sampled_token_ids
+        #logger.info(f'CXY: lp.shape={logprobs_tensors.shape}, id.shape={sampled_token_ids.shape}')
         max_gen_len = sampled_token_ids.shape[-1]
         if max_gen_len == 1:
             # No spec decode tokens.
@@ -1760,8 +1812,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 f"Total number of tokens: {end_idx} > max_model_len: "
                 f"{self.max_model_len}")
 
+            lps = logprobs_lists.logprobs[req_idx]
+            lpsum= logprobs_tensors.logprobs.exp().sum()
+            logger.info(f'[CXY] Got new token: {sampled_ids},lpsum={lpsum}, lp={lps}')
             self.input_batch.token_ids_cpu[req_idx,
                                            start_idx:end_idx] = sampled_ids
+            self.input_batch.logprobs_cpu[req_idx, start_idx:end_idx] =  logprobs_lists.logprobs[req_idx]
+            self.input_batch.logprob_ids_cpu[req_idx, start_idx:end_idx] =  logprobs_lists.logprob_token_ids[req_idx]
             self.input_batch.num_tokens_no_spec[req_idx] = end_idx
             self.input_batch.num_tokens[req_idx] = end_idx
             req_id = req_ids[req_idx]
